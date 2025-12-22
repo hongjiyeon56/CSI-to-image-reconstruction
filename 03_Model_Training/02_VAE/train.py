@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pytorch_lightning as L
 import numpy as np
 import torch
@@ -30,23 +29,19 @@ else:
 current_file_path = Path(__file__).resolve()
 current_folder = current_file_path.parent
 project_root = current_folder.parent
-data_dir = os.path.join(project_root, 'data', '2025_12_22')
-test_dir = os.path.join(project_root, 'data', '2025_12_22_test')
+data_dir = os.path.join(project_root, 'data', 'sample_train')
+test_dir = os.path.join(project_root, 'data', 'sample_test')
 
 window_size = 151
 batch_size = 32
-epochs = 100
+epochs = 10
 persistent_workers = True if num_workers > 0 else False
 
 
 def train():
     dataset = WificamDataset(data_dir, window_size)
-    
-    csi_amplitudes = dataset.csi_amplitudes[:, 0, :].T
-    plt.imshow(csi_amplitudes[:, :2000], cmap='viridis', aspect='auto')
-    plt.show()
 
-    train_idx, val_idx = train_test_split(list(range(len(dataset))), test_size=0.1, shuffle=False)
+    train_idx, val_idx = train_test_split(list(range(len(dataset))), test_size=0.3, shuffle=False)
 
     dataset_train = Subset(dataset, train_idx)
     dataset_val = Subset(dataset, val_idx)
@@ -107,10 +102,14 @@ def test():
     )
 
     output_dir = os.path.join(current_folder, 'outputs')
-    image_dir = os.path.join(output_dir, 'images')
-    os.makedirs(image_dir, exist_ok=True)
+    output_video_file = os.path.join(output_dir, 'output.mp4')
+    fps = 10
+    step = 10
+    size = (256, 128)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_file, fourcc, fps, size)
 
-    checkpoint_path = os.path.join(output_dir, 'epoch=25-val_loss=384.1094.ckpt')
+    checkpoint_path = os.path.join(output_dir, 'epoch=10-val_loss=186.5704.ckpt')
 
     model = VAE.load_from_checkpoint(
         checkpoint_path,
@@ -144,8 +143,11 @@ def test():
 
             combined_image = np.concatenate((data_sample, pred_sample), axis=1)
 
-            cv2.imwrite(os.path.join(image_dir, f'{str(idx)}.png'), combined_image)
             idx += 1
+            if idx % step == 0:
+                out.write(combined_image)
+
+    out.release()
 
 
 if __name__ == '__main__':
