@@ -39,7 +39,7 @@ Manage the full pipeline from raw signal gathering to model training.
 ### 2. Real-time Streaming
 Deploy the trained model for live image reconstruction.
 
-1.  **Flash Firmware**: Ensure the Gateway and Camera are flashed with the streaming firmware.
+1.  **Flash Firmware**: Ensure the Gateway is flashed with the streaming firmware.
 2.  **Run Inference Server**: Execute the FastAPI server to process live CSI and serve the reconstructed images.
     ```bash
     cd 02_Server/02_Streaming
