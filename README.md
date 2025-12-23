@@ -50,9 +50,7 @@ Deploy the trained model for live image reconstruction.
 ## References
 
 - **MoPoEVAE Implementation**: 
-  - Based on the paper: [Sutter, T., Daunhawer, I., & Vogt, J. (2021). Generalized Multimodal ELBO](https://arxiv.org/abs/2105.02470).
-  - Original Code: [thomassutter/MoPoE](https://github.com/thomassutter/MoPoE)
-- **KL Approximation**:
-  - Implementation from: [senya-ashukha/variational-dropout-sparsifies-dnn](https://github.com/senya-ashukha/variational-dropout-sparsifies-dnn)
+  - Based on the paper: [Strohmayer J., Sterzinger R., Stippel C. and Kampel M., “Through-Wall Imaging Based On WiFi Channel State Information](https://doi.org/10.1109/ICIP51287.2024.10647775).
+  - Original Code: [StrohmayerJ/wificam](https://github.com/StrohmayerJ/wificam)
 
 
