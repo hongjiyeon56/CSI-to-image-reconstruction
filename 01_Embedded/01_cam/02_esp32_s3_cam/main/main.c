@@ -16,8 +16,6 @@
 #define UDP_SERVER_IP   "192.168.7.45"
 #define UDP_SERVER_PORT 8001
 
-#define CONFIG_SEND_FREQUENCY 20
-
 static const char *TAG = "ESP32_S3_CAM";
 
 static camera_config_t camera_config = {
@@ -40,15 +38,14 @@ static camera_config_t camera_config = {
 
     .xclk_freq_hz   = 20000000,
     .pixel_format   = PIXFORMAT_JPEG,
-    .frame_size     = FRAMESIZE_QVGA,
-    .jpeg_quality   = 30,
-    .fb_count       = 1,
+    .frame_size     = FRAMESIZE_VGA,
+    .jpeg_quality   = 12,
+    .fb_count       = 2,
 
     .fb_location    = CAMERA_FB_IN_DRAM,
 };
 
-static esp_err_t init_camera(void)
-{
+static esp_err_t init_camera(void) {
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed");
@@ -75,20 +72,17 @@ void udp_image_send_task(void *pvParameters) {
         camera_fb_t *pic = esp_camera_fb_get();
         if (!pic) {
             ESP_LOGE(TAG, "Failed to capture image");
-            vTaskDelay(pdMS_TO_TICKS(1000 / CONFIG_SEND_FREQUENCY));
+            vTaskDelay(1);
             continue;
         }
 
         sendto(sock, pic->buf, pic->len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
         esp_camera_fb_return(pic);
-        
-        vTaskDelay(pdMS_TO_TICKS(1000 / CONFIG_SEND_FREQUENCY)); 
     }
 }
 
-void app_main(void)
-{
+void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
