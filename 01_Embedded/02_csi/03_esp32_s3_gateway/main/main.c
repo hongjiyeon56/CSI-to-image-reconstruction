@@ -18,7 +18,6 @@
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 
-#include "protocol_examples_common.h"
 
 #define UART_BAUD_RATE  921600
 #define UART_PORT_NUM   UART_NUM_1

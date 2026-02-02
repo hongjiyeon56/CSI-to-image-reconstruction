@@ -13,7 +13,6 @@
 
 #include "lwip/sockets.h"
 
-#include "protocol_examples_common.h"
 
 #define DEFAULT_WIFI_SSID   "WIFI_SSID"
 #define DEFAULT_WIFI_PWD    "WIFI_PASSWORD"
