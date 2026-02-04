@@ -15,7 +15,7 @@
 
 #define DEFAULT_WIFI_SSID   "WIFI_SSID"
 #define DEFAULT_WIFI_PWD    "WIFI_PASSWORD"
-#define DEFAULT_SERVER_IP   "192.168.190.17"
+#define DEFAULT_SERVER_IP   "192.168.1.1"
 #define DEFAULT_SERVER_PORT 8001
 
 static char s_wifi_ssid[32] = DEFAULT_WIFI_SSID;
@@ -170,62 +170,78 @@ static void nvs_save_config(void) {
     }
 }
 
+static void process_command(char *line) {
+    if (strlen(line) == 0) return;
+
+    if (strncmp(line, "SET_SSID:", 9) == 0) {
+        char *ssid = line + 9;
+        strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
+        s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+        nvs_save_config();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[OK] SSID:%s\n", s_wifi_ssid);
+        uart_write_bytes(UART_NUM_0, msg, strlen(msg));
+    } else if (strncmp(line, "SET_PWD:", 8) == 0) {
+        char *pwd = line + 8;
+        strncpy(s_wifi_pwd, pwd, sizeof(s_wifi_pwd) - 1);
+        s_wifi_pwd[sizeof(s_wifi_pwd) - 1] = '\0';
+        nvs_save_config();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[OK] PWD:%s\n", s_wifi_pwd);
+        uart_write_bytes(UART_NUM_0, msg, strlen(msg));
+    } else if (strncmp(line, "SET_IP:", 7) == 0) {
+        char *ip = line + 7;
+        strncpy(s_server_ip, ip, sizeof(s_server_ip) - 1);
+        s_server_ip[sizeof(s_server_ip) - 1] = '\0';
+        nvs_save_config();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[OK] IP:%s\n", s_server_ip);
+        uart_write_bytes(UART_NUM_0, msg, strlen(msg));
+    } else if (strncmp(line, "SET_PORT:", 9) == 0) {
+        char *port_str = line + 9;
+        s_server_port = atoi(port_str);
+        nvs_save_config();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[OK] PORT:%d\n", s_server_port);
+        uart_write_bytes(UART_NUM_0, msg, strlen(msg));
+    } else if (strncmp(line, "RESTART", 7) == 0) {
+        uart_write_bytes(UART_NUM_0, "[SYSTEM] Restarting...\n", 23);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    } else if (strncmp(line, "GET_CONFIG", 10) == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[INFO] Current Config - SSID:%s, PWD:%s, IP:%s, Port:%d\n", s_wifi_ssid, s_wifi_pwd, s_server_ip, s_server_port);
+        uart_write_bytes(UART_NUM_0, msg, strlen(msg));
+    } else if (strncmp(line, "HELP", 4) == 0) {
+        const char* help = "\n--- Commands ---\nSET_SSID:xxxx\nSET_PWD:xxxx\nSET_IP:x.x.x.x\nSET_PORT:xxxx\nGET_CONFIG\nRESTART\n-----------------\n";
+        uart_write_bytes(UART_NUM_0, help, strlen(help));
+    }
+}
+
 void uart_console_task(void *pvParameters) {
-    char buf[128];
+    uint8_t *buf = (uint8_t *) malloc(1024);
+    char line[128];
+    int line_idx = 0;
+
     uart_write_bytes(UART_NUM_0, "\n[SYSTEM] ESP32-CAM Ready. Type HELP for commands.\n", 51);
     while (1) {
-        int len = uart_read_bytes(UART_NUM_0, buf, sizeof(buf) - 1, 100 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            buf[len] = '\0';
-            if (strncmp(buf, "SET_SSID:", 9) == 0) {
-                char *ssid = buf + 9;
-                char *newline = strpbrk(ssid, "\r\n");
-                if (newline) *newline = '\0';
-                strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
-                nvs_save_config();
-                char msg[64];
-                snprintf(msg, sizeof(msg), "[OK] SSID Updated to %s\n", s_wifi_ssid);
-                uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-            } else if (strncmp(buf, "SET_PWD:", 8) == 0) {
-                char *pwd = buf + 8;
-                char *newline = strpbrk(pwd, "\r\n");
-                if (newline) *newline = '\0';
-                strncpy(s_wifi_pwd, pwd, sizeof(s_wifi_pwd) - 1);
-                nvs_save_config();
-                char msg[64];
-                snprintf(msg, sizeof(msg), "[OK] Password Updated\n");
-                uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-            } else if (strncmp(buf, "SET_IP:", 7) == 0) {
-                char *ip = buf + 7;
-                char *newline = strpbrk(ip, "\r\n");
-                if (newline) *newline = '\0';
-                strncpy(s_server_ip, ip, sizeof(s_server_ip) - 1);
-                nvs_save_config();
-                char msg[64];
-                snprintf(msg, sizeof(msg), "[OK] IP Updated to %s\n", s_server_ip);
-                uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-            } else if (strncmp(buf, "SET_PORT:", 9) == 0) {
-                char *port_str = buf + 9;
-                s_server_port = atoi(port_str);
-                nvs_save_config();
-                char msg[64];
-                snprintf(msg, sizeof(msg), "[OK] Port Updated to %d\n", s_server_port);
-                uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-            } else if (strncmp(buf, "RESTART", 7) == 0) {
-                uart_write_bytes(UART_NUM_0, "[SYSTEM] Restarting...\n", 23);
-                vTaskDelay(pdMS_TO_TICKS(500));
-                esp_restart();
-            } else if (strncmp(buf, "GET_CONFIG", 10) == 0) {
-                char msg[256];
-                snprintf(msg, sizeof(msg), "[INFO] Current Config - SSID: %s, PWD: %s, IP: %s, Port: %d\n", s_wifi_ssid, s_wifi_pwd, s_server_ip, s_server_port);
-                uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-            } else if (strncmp(buf, "HELP", 4) == 0) {
-                const char* help = "\n--- Commands ---\nSET_SSID:xxxx\nSET_PWD:xxxx\nSET_IP:x.x.x.x\nSET_PORT:xxxx\nGET_CONFIG\nRESTART\n-----------------\n";
-                uart_write_bytes(UART_NUM_0, help, strlen(help));
+        int len = uart_read_bytes(UART_NUM_0, buf, 1024, 20 / portTICK_PERIOD_MS);
+        for (int i = 0; i < len; i++) {
+            if (buf[i] == '\n' || buf[i] == '\r') {
+                if (line_idx > 0) { // Only process if line is not empty
+                    line[line_idx] = '\0';
+                    process_command(line);
+                    line_idx = 0;
+                }
+            } else {
+                if (line_idx < sizeof(line) - 1) {
+                    line[line_idx++] = buf[i];
+                }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+    free(buf);
 }
 
 void app_main(void) {
@@ -248,7 +264,7 @@ void app_main(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
     uart_param_config(UART_NUM_0, &uart_config);
 
     xTaskCreate(udp_image_send_task, "udp_image_send_task", 8192, NULL, 5, NULL);
