@@ -32,8 +32,8 @@ The Gateway and Camera modules allow real-time modification of Wi-Fi credentials
 2.  Connect your device (Gateway or Camera) via USB (UART0).
 3.  Click "Connect Device", select the COM port (115200 bps).
 4.  Enter the desired Wi-Fi SSID, Password, Server IP, and Port.
-5.  Click "Apply Settings". The tool sends the configuration commands and saves them to NVS.
-6.  Click "Reboot Device" to apply the new settings.
+5.  Click "Apply". The tool sends the configuration commands and saves them to NVS.
+6.  Click "Reboot" to apply the new settings.
 
 ## Workflows
 
