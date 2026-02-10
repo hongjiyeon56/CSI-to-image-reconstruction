@@ -226,7 +226,7 @@ button:disabled {
     margin-top: 1rem;
     background: #f8fafc;
     border-radius: 12px;
-    padding: 0.75rem;
+    padding: 0.5rem;
     height: 60px;
     overflow-y: auto;
     overflow-x: auto;
@@ -248,10 +248,10 @@ button:disabled {
 }
 
 .log-entry {
-    margin-bottom: 4px;
-    line-height: 1.4;
+    margin-bottom: 2px;
+    line-height: 1.3;
     border-bottom: 1px solid rgba(0, 0, 0, 0.02);
-    padding-bottom: 2px;
+    padding-bottom: 1px;
 }
 
 .log-sys {
