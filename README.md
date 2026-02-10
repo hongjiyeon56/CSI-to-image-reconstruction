@@ -2,6 +2,9 @@
 
 This project implements a system for reconstructing images from Channel State Information (CSI) using Wi-Fi signals. It consists of an embedded component (ESP32), a server for data collection and streaming (Python), and logic for model training.
 
+![CSI to Image Reconstruction Architecture](assets/VAE_architecture.png)
+
+
 ## Project Structure
 
 - **01_Embedded/**: ESP32 firmware code.
