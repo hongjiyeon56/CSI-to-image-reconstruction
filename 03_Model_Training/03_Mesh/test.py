@@ -1,48 +1,43 @@
 import os
 from pathlib import Path
-
 import numpy as np
 import torch
 import cv2
 from torch.utils.data import Subset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-
 from dataset import WificamDataset, NUM_SUBCARRIERS
 from vae import VAE
 
-
 num_workers = 2
 torch.set_num_threads(4)
+
 if torch.backends.mps.is_available():
     device = torch.device('mps')
-    accelerator = 'mps'
 elif torch.cuda.is_available():
     device = torch.device('cuda')
-    accelerator = 'gpu'
 else:
     device = torch.device('cpu')
-    accelerator = 'cpu'
 
 current_file_path = Path(__file__).resolve()
 current_folder = current_file_path.parent
 project_root = current_folder.parent
-test_dir = os.path.join(project_root, 'data', 'data_2026_01_20_mesh')
 
+test_dir = os.path.join(project_root, 'data', 'data_2026_01_20_mesh')
 output_dir = os.path.join(current_folder, 'outputs')
 output_video_file = os.path.join(output_dir, 'output.mp4')
+
 fps = 10
 step = 10
-size = (128, 128)
+size = (256, 128)  # 반반 나란히라서 width 2배
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-checkpoint_path = os.path.join(output_dir, 'epoch=42-val_loss=1413.0200.ckpt')
+checkpoint_path = os.path.join(output_dir, 'best_vae-epoch=185-val_loss=394.0456.ckpt')
 image_dir = os.path.join(output_dir, 'images')
 os.makedirs(image_dir, exist_ok=True)
 
 window_size = 151
 batch_size = 32
 persistent_workers = True if num_workers > 0 else False
-
 
 def test():
     dataset = WificamDataset(test_dir, window_size)
@@ -65,10 +60,9 @@ def test():
         window_size=window_size,
         num_subcarriers=NUM_SUBCARRIERS,
     )
-
     model.to(device)
     model.eval()
-    
+
     idx = 0
     for batch in tqdm(dataloader_test):
         spectrogram, image = batch
@@ -76,7 +70,7 @@ def test():
         image = image.to(device)
 
         with torch.no_grad():
-            reconstruction = model.decode(model.encode(spectrogram))
+            reconstruction, mu, logvar = model(spectrogram)
 
         image = image.permute(0, 2, 3, 1).cpu().numpy()
         reconstruction = reconstruction.permute(0, 2, 3, 1).cpu().numpy()
@@ -85,15 +79,15 @@ def test():
             data_content = (np.clip(image[i][..., ::-1], 0, 1) * 255).astype(np.uint8)
             pred_content = (np.clip(reconstruction[i][..., ::-1], 0, 1) * 255).astype(np.uint8)
 
-            mask = np.any(pred_content > 10, axis=-1)
-            data_content[mask] = pred_content[mask]
+            # 원본 | 복원 나란히 붙이기
+            combined = np.concatenate([data_content, pred_content], axis=1)
 
             idx += 1
             if idx % step == 0:
-                out.write(data_content)
+                out.write(combined)
 
     out.release()
-
+    print(f"✅ Video saved to: {output_video_file}")
 
 if __name__ == '__main__':
     test()
