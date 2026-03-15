@@ -23,15 +23,15 @@ current_file_path = Path(__file__).resolve()
 current_folder = current_file_path.parent
 project_root = current_folder.parent
 
-test_dir = os.path.join(project_root, 'data', 'data_2026_01_20_mesh')
+test_dir = os.path.join(project_root, 'data', '20260309_train_mesh')
 output_dir = os.path.join(current_folder, 'outputs')
-output_video_file = os.path.join(output_dir, 'output.mp4')
+output_video_file = os.path.join(output_dir, 'last_vae-epoch=199-val_loss=368.1650.mp4')
 
 fps = 10
 step = 10
 size = (256, 128)  # 반반 나란히라서 width 2배
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-checkpoint_path = os.path.join(output_dir, 'best_vae-epoch=185-val_loss=394.0456.ckpt')
+checkpoint_path = os.path.join(output_dir, 'last_vae-epoch=199-val_loss=368.1650.ckpt')
 image_dir = os.path.join(output_dir, 'images')
 os.makedirs(image_dir, exist_ok=True)
 
@@ -70,7 +70,7 @@ def test():
         image = image.to(device)
 
         with torch.no_grad():
-            reconstruction, mu, logvar = model(spectrogram)
+            reconstruction, mu, logvar, z = model(spectrogram)
 
         image = image.permute(0, 2, 3, 1).cpu().numpy()
         reconstruction = reconstruction.permute(0, 2, 3, 1).cpu().numpy()
