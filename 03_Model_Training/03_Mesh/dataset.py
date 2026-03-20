@@ -7,18 +7,51 @@ from glob import glob
 
 CSI_VALID_SUBCARRIER_INDEX = [i for i in range(6, 32)] + [i for i in range(33, 59)]
 NUM_SUBCARRIERS = len(CSI_VALID_SUBCARRIER_INDEX)
+IMAGE_HEIGHT = 480
+IMAGE_WIDTH = 640
 
 class WificamDataset(Dataset):
     def __init__(self, base_dir, window_size):
         self.base_dir, self.window_size = base_dir, window_size
         self.csi_amplitudes, self.image_paths = [], []
         self.load_data()
+
+    @staticmethod
+    def _valid_json(value):
+        if pd.isna(value):
+            return False
+        try:
+            json.loads(value)
+            return True
+        except (TypeError, json.JSONDecodeError):
+            return False
+
+    @staticmethod
+    def _read_csi_csv(path):
+        try:
+            return pd.read_csv(path, dtype=str, low_memory=False)
+        except pd.errors.ParserError:
+            return pd.read_csv(
+                path,
+                dtype=str,
+                engine='python',
+                on_bad_lines='skip',
+            )
     
     def load_data(self):
         csv_paths = glob(os.path.join(self.base_dir, '**', 'csi.csv'), recursive=True)
         for path in csv_paths:
             d_dir = os.path.dirname(path)
-            df = pd.read_csv(path).sort_values('id')
+            df = self._read_csi_csv(path)
+            df = df[df['type'] == 'CSI_DATA'].copy()
+            df = df[df['data'].apply(self._valid_json)].copy()
+            df['id'] = pd.to_numeric(df['id'], errors='coerce')
+            df = df.dropna(subset=['id']).sort_values('id').reset_index(drop=True)
+            df['id'] = df['id'].astype(np.int64)
+
+            if df.empty:
+                continue
+
             raw = np.array([json.loads(x) for x in df['data'].values])
             
             real = raw[:, [i * 2 for i in CSI_VALID_SUBCARRIER_INDEX]]
@@ -39,5 +72,5 @@ class WificamDataset(Dataset):
     def __getitem__(self, idx):
         csi = torch.from_numpy(self.csi_amplitudes[idx])
         img = cv2.imread(self.image_paths[idx])
-        img = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (128, 128))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # 리사이즈 제거, 원본 그대로
         return csi, torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
