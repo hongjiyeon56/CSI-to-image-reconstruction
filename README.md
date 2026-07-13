@@ -1,5 +1,5 @@
 # CSI to Image Reconstruction
-
+이 버전은 iou loss 추가해서 metric 까지 뽑는 코드입니당 (amplitude 데이터 피쳐 뽑은거 사용하기 전 코드)
 This project implements a system for reconstructing images from Channel State Information (CSI) using Wi-Fi signals. It consists of an embedded component (ESP32), a server for data collection and streaming (Python), and logic for model training.
 
 ![CSI to Image Reconstruction Architecture](assets/VAE_architecture.png)
