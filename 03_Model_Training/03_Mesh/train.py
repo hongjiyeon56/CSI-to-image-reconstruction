@@ -1,261 +1,225 @@
-import os
-from pathlib import Path
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import json
+from __future__ import annotations
 
+import argparse
+import json
+from pathlib import Path
+
+import pandas as pd
 import pytorch_lightning as L
 import torch
-from torch.utils.data import Subset, DataLoader
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
 
-from dataset import WificamDataset, NUM_SUBCARRIERS
+from dataset import (
+    NUM_SUBCARRIERS,
+    WificamDataset,
+    compute_normalization_stats,
+    discover_csi_csvs,
+)
 from vae import VAE
 
 
-num_workers = 0
-torch.set_num_threads(4)
-
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-    accelerator = 'mps'
-elif torch.cuda.is_available():
-    device = torch.device('cuda')
-    accelerator = 'gpu'
-else:
-    device = torch.device('cpu')
-    accelerator = 'cpu'
-
-
-current_file_path = Path(__file__).resolve()
-current_folder = current_file_path.parent
-project_root = current_folder.parent
-
-data_dir = os.path.join(project_root, 'data', 'rx1_train')
-
-window_size = 151
-batch_size = 32
-epochs = 200
-
-persistent_workers = True if num_workers > 0 else False
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="../data/rx1_train")
+    parser.add_argument("--output_dir", type=str, default="./outputs/0714_window_mean_vae")
+    parser.add_argument("--window_size", type=int, default=151)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=4)
+    parser.add_argument("--z_dim", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--noise_std", type=float, default=0.003)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume_from", type=str, default=None)
+    return parser.parse_args()
 
 
-class LossHistory(L.Callback):
-    def __init__(self, save_dir):
-        super().__init__()
-        self.save_dir = save_dir
-        self.history_path = os.path.join(save_dir, "loss_history.json")
+def build_train_val_split(
+    csv_paths: list[str],
+    val_ratio: float,
+    window_size: int,
+    seed: int,
+) -> tuple[
+    list[str],
+    list[str],
+    dict[str, tuple[int, int]],
+    dict[str, tuple[int, int]],
+]:
+    """
+    csi.csv가 여러 개면 session 단위로 분리한다.
+    하나뿐이면 시간축 연속 구간으로 나누어 window 중복을 방지한다.
+    """
+    resolved_paths = [str(Path(path).resolve()) for path in csv_paths]
 
-        if os.path.exists(self.history_path):
-            with open(self.history_path, "r") as f:
-                self.history = json.load(f)
-            print("loss history 불러옴")
-        else:
-            self.history = {
-                # total loss
-                "train_loss": [],
-                "val_loss": [],
+    if len(resolved_paths) >= 2:
+        train_paths, val_paths = train_test_split(
+            resolved_paths,
+            test_size=val_ratio,
+            random_state=seed,
+            shuffle=True,
+        )
+        return sorted(train_paths), sorted(val_paths), {}, {}
 
-                # VAE loss
-                "train_kl": [],
-                "val_kl": [],
-                "train_l1": [],
-                "val_l1": [],
+    only_path = resolved_paths[0]
+    row_count = len(pd.read_csv(only_path, usecols=["id"]))
+    split_row = int(row_count * (1.0 - val_ratio))
+    minimum_rows = window_size + 1
 
-                # Dice / IoU loss
-                "train_dice": [],
-                "val_dice": [],
-                "train_iou": [],
-                "val_iou": [],
-
-                # image structure loss
-                "train_grad": [],
-                "val_grad": [],
-                "train_freq": [],
-                "val_freq": [],
-            }
-
-    def save_history(self):
-        with open(self.history_path, "w") as f:
-            json.dump(self.history, f, indent=4)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        for key in self.history.keys():
-            if key.startswith("train"):
-                val = trainer.callback_metrics.get(key)
-                if val is not None:
-                    self.history[key].append(val.detach().cpu().item())
-
-        if len(self.history["train_loss"]) > 0:
-            msg = f"[Epoch {trainer.current_epoch}] train_loss: {self.history['train_loss'][-1]:.7f}"
-
-            if len(self.history["train_dice"]) > 0:
-                msg += f", train_dice: {self.history['train_dice'][-1]:.7f}"
-
-            if len(self.history["train_iou"]) > 0:
-                msg += f", train_iou: {self.history['train_iou'][-1]:.7f}"
-
-            print(msg)
-
-        self.save_history()
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        for key in self.history.keys():
-            if key.startswith("val"):
-                val = trainer.callback_metrics.get(key)
-                if val is not None:
-                    self.history[key].append(val.detach().cpu().item())
-
-        self.save_history()
-
-
-class LatestCheckpoints(L.Callback):
-    def __init__(self, dirpath, keep_last=3):
-        super().__init__()
-        self.dirpath = Path(dirpath)
-        self.keep_last = keep_last
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if trainer.sanity_checking:
-            return
-
-        val_loss = trainer.callback_metrics.get("val_loss")
-        if val_loss is None:
-            filename = f"latest-epoch={trainer.current_epoch}.ckpt"
-        else:
-            filename = f"latest-epoch={trainer.current_epoch}-val_loss={val_loss.detach().cpu().item():.7f}.ckpt"
-
-        ckpt_path = self.dirpath / filename
-        trainer.save_checkpoint(str(ckpt_path))
-        self._delete_old_checkpoints()
-
-    def _delete_old_checkpoints(self):
-        checkpoints = sorted(
-            self.dirpath.glob("latest-epoch=*.ckpt"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True
+    if split_row < minimum_rows or row_count - split_row < minimum_rows:
+        raise ValueError(
+            "단일 csi.csv를 train/val로 나누기에는 데이터가 부족합니다. "
+            f"rows={row_count}, window_size={window_size}"
         )
 
-        for checkpoint in checkpoints[self.keep_last:]:
-            checkpoint.unlink(missing_ok=True)
+    train_ranges = {only_path: (0, split_row)}
+    val_ranges = {only_path: (split_row, row_count)}
+    return [only_path], [only_path], train_ranges, val_ranges
 
 
-def find_latest_checkpoint(output_dir):
-    output_path = Path(output_dir)
-    checkpoints = sorted(
-        output_path.glob("latest-epoch=*.ckpt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True
-    )
-    if checkpoints:
-        return str(checkpoints[0])
+def main() -> None:
+    args = parse_args()
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("val_ratio는 0과 1 사이여야 합니다.")
 
-    last_checkpoint = output_path / "last.ckpt"
-    return str(last_checkpoint) if last_checkpoint.exists() else None
+    L.seed_everything(args.seed, workers=True)
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-def train():
-    # Dice + IoU loss 실험이므로 기존 output과 분리
-    output_dir = os.path.join(current_folder, 'outputs/0708_outputs_rx1_dice_iou_loss')
-    save_dir = os.path.join(output_dir, 'loss')
-
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(save_dir, exist_ok=True)
-
-    loss_history = LossHistory(save_dir)
-
-    dataset_train = WificamDataset(data_dir, window_size, is_train=True)
-    dataset_val = WificamDataset(data_dir, window_size, is_train=False)
-
-    train_idx, val_idx = train_test_split(
-        list(range(len(dataset_train))),
-        test_size=0.1,
-        shuffle=False
+    csv_paths = discover_csi_csvs(args.data_dir)
+    (
+        train_csv_paths,
+        val_csv_paths,
+        train_row_ranges,
+        val_row_ranges,
+    ) = build_train_val_split(
+        csv_paths=csv_paths,
+        val_ratio=args.val_ratio,
+        window_size=args.window_size,
+        seed=args.seed,
     )
 
-    dataset_train = Subset(dataset_train, train_idx)
-    dataset_val = Subset(dataset_val, val_idx)
+    # train 데이터만으로 normalization 통계를 계산한다.
+    stats = compute_normalization_stats(
+        train_csv_paths,
+        row_ranges=train_row_ranges,
+    )
+    stats.save(output_dir / "normalization.json")
 
-    dataloader_train = DataLoader(
-        dataset_train,
-        batch_size=batch_size,
+    split_info = {
+        "train_csv_paths": train_csv_paths,
+        "val_csv_paths": val_csv_paths,
+        "train_row_ranges": train_row_ranges,
+        "val_row_ranges": val_row_ranges,
+        "window_size": args.window_size,
+        "val_ratio": args.val_ratio,
+        "seed": args.seed,
+    }
+    (output_dir / "split_info.json").write_text(
+        json.dumps(split_info, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    train_dataset = WificamDataset(
+        csv_paths=train_csv_paths,
+        window_size=args.window_size,
+        normalization_stats=stats,
+        is_train=True,
+        row_ranges=train_row_ranges,
+        noise_std=args.noise_std,
+    )
+    val_dataset = WificamDataset(
+        csv_paths=val_csv_paths,
+        window_size=args.window_size,
+        normalization_stats=stats,
+        is_train=False,
+        row_ranges=val_row_ranges,
+        noise_std=0.0,
+    )
+
+    persistent_workers = args.num_workers > 0
+    pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
         drop_last=True,
-        num_workers=num_workers,
         persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
-
-    dataloader_val = DataLoader(
-        dataset_val,
-        batch_size=batch_size * 2,
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
         shuffle=False,
-        drop_last=True,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
+        drop_last=False,
         persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
 
     model = VAE(
-        window_size=window_size,
-        num_subcarriers=NUM_SUBCARRIERS
+        window_size=args.window_size,
+        num_subcarriers=NUM_SUBCARRIERS,
+        z_dim=args.z_dim,
+        lr=args.lr,
     )
 
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
-        mode='min',
-        save_top_k=5,
-        save_last=False,
-        filename='top-epoch={epoch}-val_loss={val_loss:.7f}',
-        dirpath=output_dir,
+        monitor="val_loss",
+        mode="min",
+        dirpath=output_dir / "checkpoints",
+        filename="best-window-mean-vae-{epoch:03d}-{val_loss:.4f}",
+        save_top_k=1,
+        save_last=True,
+    )
+    epoch_checkpoint_callback = ModelCheckpoint(
+        dirpath=output_dir / "checkpoints" / "epochs",
+        filename="epoch-{epoch:03d}-val_loss-{val_loss:.4f}",
+        save_top_k=-1,
+        every_n_epochs=1,
+        save_on_train_epoch_end=False,
         auto_insert_metric_name=False,
-        verbose=True
     )
-
-    latest_checkpoint_callback = LatestCheckpoints(
-        dirpath=output_dir,
-        keep_last=3
-    )
-
-    callbacks = [
-        checkpoint_callback,
-        latest_checkpoint_callback,
-        loss_history
-    ]
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    logger = CSVLogger(save_dir=str(output_dir), name="logs")
+    # PyTorch Lightning 1.9.x uses integer precision values.
+    precision = 16 if torch.cuda.is_available() else 32
 
     trainer = L.Trainer(
-        accelerator=accelerator,
+        accelerator="auto",
         devices=1,
+        max_epochs=args.epochs,
+        callbacks=[
+            checkpoint_callback,
+            epoch_checkpoint_callback,
+            lr_monitor,
+        ],
+        logger=logger,
+        precision=precision,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=1.0,
-        logger=True,
-        callbacks=callbacks,
-        max_epochs=epochs
+        log_every_n_steps=20,
+        deterministic=False,
     )
 
-    checkpoint_path = find_latest_checkpoint(output_dir)
+    trainer.fit(
+        model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=args.resume_from,
+    )
 
-    if checkpoint_path is not None:
-        print("기존 checkpoint 발견. 이어서 학습합니다:", checkpoint_path)
-        trainer.fit(
-            model,
-            dataloader_train,
-            dataloader_val,
-            ckpt_path=checkpoint_path
-        )
-    else:
-        print("새로운 학습을 시작합니다.")
-        trainer.fit(
-            model,
-            dataloader_train,
-            dataloader_val
-        )
+    print("\n학습 완료")
+    print("Best checkpoint:", checkpoint_callback.best_model_path)
+    print("Normalization:", output_dir / "normalization.json")
 
 
-if __name__ == '__main__':
-    print("project_root:", project_root)
-    print("data_dir:", data_dir)
-    print("exists:", os.path.exists(data_dir))
-    print("accelerator:", accelerator)
-
-    train()
+if __name__ == "__main__":
+    main()
