@@ -1,4 +1,5 @@
 # CSI to Image Reconstruction
+amplitude branch 추가 !!
 
 This project implements a system for reconstructing images from Channel State Information (CSI) using Wi-Fi signals. It consists of an embedded component (ESP32), a server for data collection and streaming (Python), and logic for model training.
 
