@@ -1,756 +1,1066 @@
-import os
-import csv
-import math
+from __future__ import annotations
+
 import argparse
+import csv
+import json
+import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from skimage.metrics import structural_similarity as ssim
-
-from dataset import WificamDataset, NUM_SUBCARRIERS
+from dataset import NormalizationStats, WificamDataset, discover_csi_csvs
 from vae import VAE
 
 
-# =========================
-# 기본 설정
-# =========================
-num_workers = 2
-torch.set_num_threads(4)
+# ============================================================
+# 실행 인자
+# ============================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
 
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    accelerator = "mps"
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    accelerator = "gpu"
-else:
-    device = torch.device("cpu")
-    accelerator = "cpu"
+    parser.add_argument("--data_dir",type=str,default="../data/rx1_test")
+    parser.add_argument("--checkpoint",type=str,default="./outputs/0714_window_mean_vae/checkpoints/epochs/epoch-199-val_loss-0.0178.ckpt" )
+    parser.add_argument("--normalization_path", type=str,default="./outputs/0714_window_mean_vae/normalization.json")
+    parser.add_argument("--output_dir",type=str,default="./outputs/0714_window_mean_vae")
+    parser.add_argument("--window_size", type=int, default=151)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
 
+    # 0~1 범위 이미지 기준 마스크 임계값
+    parser.add_argument("--mask_threshold", type=float, default=0.05)
 
-# =========================
-# Metric 함수들
-# =========================
-def compute_psnr(gt_img, pred_img):
-    gt = gt_img.astype(np.float32)
-    pred = pred_img.astype(np.float32)
+    # 영상 FPS
+    parser.add_argument("--fps", type=int, default=10)
 
-    mse = np.mean((gt - pred) ** 2)
-
-    if mse == 0:
-        return float("inf")
-
-    return 20 * math.log10(255.0 / math.sqrt(mse))
-
-
-def compute_ssim(gt_img, pred_img):
-    """
-    gt_img, pred_img: uint8, BGR, HWC
-    grayscale 기준 SSIM 계산
-    """
-    gt_gray = cv2.cvtColor(gt_img, cv2.COLOR_BGR2GRAY)
-    pred_gray = cv2.cvtColor(pred_img, cv2.COLOR_BGR2GRAY)
-
-    score = ssim(
-        gt_gray,
-        pred_gray,
-        data_range=255,
+    # 이미지 저장 옵션
+    parser.add_argument(
+        "--save_images",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_save_images",
+        dest="save_images",
+        action="store_false",
     )
 
-    return score
+    # bbox 이미지 저장 옵션
+    parser.add_argument(
+        "--save_bbox_images",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_save_bbox_images",
+        dest="save_bbox_images",
+        action="store_false",
+    )
+
+    # 마스크 저장 옵션
+    parser.add_argument(
+        "--save_masks",
+        action="store_true",
+        default=True,
+    )
+
+    # 일반 비교 영상 저장 옵션
+    parser.add_argument(
+        "--save_video",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_save_video",
+        dest="save_video",
+        action="store_false",
+    )
+
+    # bbox 비교 영상 저장 옵션
+    parser.add_argument(
+        "--save_bbox_video",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_save_bbox_video",
+        dest="save_bbox_video",
+        action="store_false",
+    )
+
+    return parser.parse_args()
 
 
-def compute_iou(gt_mask, pred_mask):
-    intersection = np.logical_and(gt_mask, pred_mask).sum()
-    union = np.logical_or(gt_mask, pred_mask).sum()
+# ============================================================
+# Metric 함수
+# ============================================================
+def batch_psnr(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    mse = (
+        (prediction - target)
+        .pow(2)
+        .flatten(1)
+        .mean(dim=1)
+    )
 
-    if union == 0:
-        return 1.0
-
-    return intersection / union
-
-
-def compute_dice(gt_mask, pred_mask):
-    intersection = np.logical_and(gt_mask, pred_mask).sum()
-    total = gt_mask.sum() + pred_mask.sum()
-
-    if total == 0:
-        return 1.0
-
-    return (2.0 * intersection) / total
+    return 10.0 * torch.log10(1.0 / (mse + 1e-8))
 
 
-def get_bbox_from_mask(mask):
+def batch_ssim(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 11,
+) -> torch.Tensor:
+    padding = window_size // 2
+
+    mu_pred = F.avg_pool2d(
+        prediction,
+        window_size,
+        stride=1,
+        padding=padding,
+    )
+    mu_target = F.avg_pool2d(
+        target,
+        window_size,
+        stride=1,
+        padding=padding,
+    )
+
+    mu_pred_sq = mu_pred.pow(2)
+    mu_target_sq = mu_target.pow(2)
+    mu_cross = mu_pred * mu_target
+
+    sigma_pred = F.avg_pool2d(
+        prediction * prediction,
+        window_size,
+        stride=1,
+        padding=padding,
+    ) - mu_pred_sq
+
+    sigma_target = F.avg_pool2d(
+        target * target,
+        window_size,
+        stride=1,
+        padding=padding,
+    ) - mu_target_sq
+
+    sigma_cross = F.avg_pool2d(
+        prediction * target,
+        window_size,
+        stride=1,
+        padding=padding,
+    ) - mu_cross
+
+    c1 = 0.01**2
+    c2 = 0.03**2
+
+    numerator = (
+        (2.0 * mu_cross + c1)
+        * (2.0 * sigma_cross + c2)
+    )
+
+    denominator = (
+        (mu_pred_sq + mu_target_sq + c1)
+        * (sigma_pred + sigma_target + c2)
+    )
+
+    ssim_map = numerator / (denominator + 1e-8)
+
+    return ssim_map.flatten(1).mean(dim=1)
+
+
+def masks_from_images(
+    images: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
     """
-    mask: bool, HW
-    return: (x1, y1, x2, y2) or None
+    images: B, C, H, W
+    return: B, H, W bool mask
+    """
+    return images.mean(dim=1) > threshold
+
+
+def batch_iou_dice(
+    prediction_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    intersection = (
+        (prediction_mask & target_mask)
+        .flatten(1)
+        .sum(dim=1)
+        .float()
+    )
+
+    union = (
+        (prediction_mask | target_mask)
+        .flatten(1)
+        .sum(dim=1)
+        .float()
+    )
+
+    pred_area = (
+        prediction_mask
+        .flatten(1)
+        .sum(dim=1)
+        .float()
+    )
+
+    target_area = (
+        target_mask
+        .flatten(1)
+        .sum(dim=1)
+        .float()
+    )
+
+    iou = (intersection + 1e-8) / (union + 1e-8)
+
+    dice = (2.0 * intersection + 1e-8) / (
+        pred_area + target_area + 1e-8
+    )
+
+    return iou, dice
+
+
+# ============================================================
+# Bounding Box 함수
+# ============================================================
+def bbox_from_mask(
+    mask: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """
+    mask: H, W bool 배열
+
+    return:
+        (x1, y1, x2, y2)
+        마스크가 없으면 None
     """
     ys, xs = np.where(mask)
 
-    if len(xs) == 0 or len(ys) == 0:
+    if len(xs) == 0:
         return None
 
-    x1 = int(xs.min())
-    y1 = int(ys.min())
-    x2 = int(xs.max())
-    y2 = int(ys.max())
-
-    return x1, y1, x2, y2
-
-
-def compute_bbox_iou_from_bboxes(gt_bbox, pred_bbox):
-    """
-    gt_bbox, pred_bbox: (x1, y1, x2, y2) or None
-    """
-    if gt_bbox is None and pred_bbox is None:
-        return 1.0
-
-    if gt_bbox is None or pred_bbox is None:
-        return 0.0
-
-    gx1, gy1, gx2, gy2 = gt_bbox
-    px1, py1, px2, py2 = pred_bbox
-
-    inter_x1 = max(gx1, px1)
-    inter_y1 = max(gy1, py1)
-    inter_x2 = min(gx2, px2)
-    inter_y2 = min(gy2, py2)
-
-    inter_w = max(0, inter_x2 - inter_x1 + 1)
-    inter_h = max(0, inter_y2 - inter_y1 + 1)
-    inter_area = inter_w * inter_h
-
-    gt_area = (gx2 - gx1 + 1) * (gy2 - gy1 + 1)
-    pred_area = (px2 - px1 + 1) * (py2 - py1 + 1)
-
-    union_area = gt_area + pred_area - inter_area
-
-    if union_area == 0:
-        return 0.0
-
-    return inter_area / union_area
-
-
-def safe_mean(values):
-    values = [v for v in values if not np.isnan(v)]
-
-    if len(values) == 0:
-        return float("nan")
-
-    return float(np.mean(values))
-
-
-def safe_std(values):
-    values = [v for v in values if not np.isnan(v)]
-
-    if len(values) == 0:
-        return float("nan")
-
-    return float(np.std(values))
-
-
-def to_fid_tensor(img_bgr):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).unsqueeze(0)
-    return tensor.to(torch.uint8)
-
-
-# =========================
-# Mask 생성 함수
-# =========================
-def keep_largest_component(mask_uint8):
-    """
-    mask_uint8: 0 또는 255 값을 갖는 uint8 mask
-    가장 큰 connected component만 남김
-    """
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask_uint8,
-        connectivity=8,
+    return (
+        int(xs.min()),
+        int(ys.min()),
+        int(xs.max()),
+        int(ys.max()),
     )
 
-    # label 0은 배경
-    if num_labels <= 1:
-        return mask_uint8
 
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    largest_label = 1 + np.argmax(areas)
+def bbox_iou(
+    first: tuple[int, int, int, int] | None,
+    second: tuple[int, int, int, int] | None,
+) -> float:
+    if first is None and second is None:
+        return 1.0
 
-    largest_mask = np.zeros_like(mask_uint8)
-    largest_mask[labels == largest_label] = 255
+    if first is None or second is None:
+        return 0.0
 
-    return largest_mask
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+
+    intersection_width = max(0, x2 - x1 + 1)
+    intersection_height = max(0, y2 - y1 + 1)
+
+    intersection = intersection_width * intersection_height
+
+    first_area = (
+        (first[2] - first[0] + 1)
+        * (first[3] - first[1] + 1)
+    )
+
+    second_area = (
+        (second[2] - second[0] + 1)
+        * (second[3] - second[1] + 1)
+    )
+
+    union = first_area + second_area - intersection
+
+    return float(intersection / max(union, 1))
 
 
-def make_binary_mask(img_bgr, threshold=10, use_morphology=False, keep_largest=False):
+def draw_bbox(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int] | None,
+    label: str,
+) -> np.ndarray:
     """
-    img_bgr: uint8, HWC, BGR
-    return: bool mask, HW
+    image: uint8 BGR 이미지
     """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-
-    if use_morphology:
-        kernel = np.ones((3, 3), np.uint8)
-
-        # 작은 노이즈 제거
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # 작은 구멍 메우기
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    if keep_largest:
-        mask = keep_largest_component(mask)
-
-    return mask > 0
-
-
-# =========================
-# bbox 시각화 함수
-# =========================
-def draw_bbox(img, bbox, label=None):
-    """
-    img: uint8, BGR, HWC
-    bbox: (x1, y1, x2, y2) or None
-    """
-    out = img.copy()
+    output = image.copy()
 
     if bbox is None:
-        return out
+        cv2.putText(
+            output,
+            f"{label}: No bbox",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return output
 
     x1, y1, x2, y2 = bbox
 
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.rectangle(
+        output,
+        (x1, y1),
+        (x2, y2),
+        (0, 255, 0),
+        2,
+    )
 
-    if label is not None:
-        cv2.putText(
-            out,
-            label,
-            (x1, max(y1 - 8, 15)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
+    cv2.putText(
+        output,
+        label,
+        (x1, max(y1 - 8, 18)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    return output
+
+
+# ============================================================
+# 이미지 변환 및 저장 함수
+# ============================================================
+def tensor_to_bgr(image: torch.Tensor) -> np.ndarray:
+    """
+    image: C, H, W / RGB / 0~1 범위
+
+    return:
+        H, W, C / BGR / uint8
+    """
+    image_np = (
+        image.detach()
+        .float()
+        .cpu()
+        .clamp(0.0, 1.0)
+        .permute(1, 2, 0)
+        .numpy()
+    )
+
+    image_np = (image_np * 255.0).astype(np.uint8)
+
+    return cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+
+def save_image(
+    output_path: Path,
+    image: np.ndarray,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    success = cv2.imwrite(
+        str(output_path),
+        image,
+    )
+
+    if not success:
+        raise RuntimeError(
+            f"이미지 저장 실패: {output_path}"
         )
 
-    return out
+
+def make_bbox_visualization(
+    target_bgr: np.ndarray,
+    prediction_bgr: np.ndarray,
+    target_bbox: tuple[int, int, int, int] | None,
+    prediction_bbox: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    target_bbox_image = draw_bbox(
+        target_bgr,
+        target_bbox,
+        "GT",
+    )
+
+    prediction_bbox_image = draw_bbox(
+        prediction_bgr,
+        prediction_bbox,
+        "Pred",
+    )
+
+    return np.concatenate(
+        [
+            target_bbox_image,
+            prediction_bbox_image,
+        ],
+        axis=1,
+    )
 
 
-def make_bbox_visualization(gt_img, pred_img, gt_mask, pred_mask):
+# ============================================================
+# 이미지 폴더를 MP4 영상으로 변환
+# ============================================================
+def natural_key(path: Path) -> tuple[int, str]:
     """
-    GT/PRED 이미지 위에 bbox를 그리고 좌우로 붙임
+    파일 이름의 앞쪽 sample_index를 기준으로 정렬
+    예:
+        000001_123.png
+        000002_124.png
     """
-    gt_bbox = get_bbox_from_mask(gt_mask)
-    pred_bbox = get_bbox_from_mask(pred_mask)
-
-    gt_vis = draw_bbox(gt_img, gt_bbox, label="GT")
-    pred_vis = draw_bbox(pred_img, pred_bbox, label="Pred")
-
-    bbox_compare = np.concatenate([gt_vis, pred_vis], axis=1)
-
-    return bbox_compare, gt_bbox, pred_bbox
-
-
-# =========================
-# 이미지 파일 정렬용
-# =========================
-def natural_key(filename):
-    name = os.path.splitext(filename)[0]
-
-    # 예: 123_bbox.png 같은 경우도 숫자 기준으로 정렬
-    name = name.replace("_bbox", "")
+    first_part = path.stem.split("_")[0]
 
     try:
-        return int(name)
+        return int(first_part), path.name
     except ValueError:
-        return name
+        return 0, path.name
 
 
-# =========================
-# 이미지 폴더 → mp4 변환
-# =========================
-def make_video_from_image_folder(image_folder, output_video_path, fps=10):
-    image_files = [
-        f for f in os.listdir(image_folder)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    ]
+def make_video_from_image_folder(
+    image_folder: Path,
+    output_video_path: Path,
+    fps: int = 10,
+) -> None:
+    image_files = sorted(
+        [
+            path
+            for path in image_folder.iterdir()
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        ],
+        key=natural_key,
+    )
 
-    image_files = sorted(image_files, key=natural_key)
-
-    if len(image_files) == 0:
-        print("영상으로 만들 이미지가 없습니다:", image_folder)
+    if not image_files:
+        print(
+            "영상으로 만들 이미지가 없습니다:",
+            image_folder,
+        )
         return
 
-    first_path = os.path.join(image_folder, image_files[0])
-    first_frame = cv2.imread(first_path)
+    first_frame = cv2.imread(str(image_files[0]))
 
     if first_frame is None:
-        print("첫 프레임을 읽을 수 없습니다:", first_path)
+        print(
+            "첫 번째 프레임을 읽지 못했습니다:",
+            image_files[0],
+        )
         return
 
-    h, w = first_frame.shape[:2]
+    height, width = first_frame.shape[:2]
+
+    output_video_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (w, h))
 
-    for filename in tqdm(image_files, desc=f"영상 생성 중: {os.path.basename(image_folder)}"):
-        img_path = os.path.join(image_folder, filename)
-        frame = cv2.imread(img_path)
+    writer = cv2.VideoWriter(
+        str(output_video_path),
+        fourcc,
+        fps,
+        (width, height),
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"영상 파일을 열 수 없습니다: {output_video_path}"
+        )
+
+    for image_path in tqdm(
+        image_files,
+        desc=f"영상 생성: {output_video_path.name}",
+    ):
+        frame = cv2.imread(str(image_path))
 
         if frame is None:
-            print("이미지 못읽음:", img_path)
+            print("이미지 읽기 실패:", image_path)
             continue
 
-        if frame.shape[:2] != (h, w):
-            frame = cv2.resize(frame, (w, h))
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(
+                frame,
+                (width, height),
+            )
 
-        out.write(frame)
+        writer.write(frame)
 
-    out.release()
+    writer.release()
+
     print("영상 저장 완료:", output_video_path)
 
 
-# =========================
+# ============================================================
 # Main
-# =========================
-def main(args):
-    current_file_path = Path(__file__).resolve()
-    current_folder = current_file_path.parent
-    project_root = current_folder.parent
+# ============================================================
+def main() -> None:
+    args = parse_args()
 
-    test_dir = args.test_dir
-    output_dir = args.output_dir
-    checkpoint_path = args.checkpoint_path
+    # --------------------------------------------------------
+    # 저장 폴더 구성
+    # --------------------------------------------------------
+    output_dir = Path(args.output_dir)
 
-    image_dir = os.path.join(output_dir, "images")
-    gt_dir = os.path.join(image_dir, "gt")
-    pred_dir = os.path.join(image_dir, "pred")
-    compare_dir = os.path.join(image_dir, "compare")
-    bbox_compare_dir = os.path.join(image_dir, "bbox_compare")
+    image_dir = output_dir / "images"
 
-    mask_dir = os.path.join(image_dir, "mask")
-    mask_gt_dir = os.path.join(mask_dir, "gt")
-    mask_pred_dir = os.path.join(mask_dir, "pred")
+    gt_dir = image_dir / "gt"
+    pred_dir = image_dir / "pred"
+    compare_dir = image_dir / "compare"
+    bbox_compare_dir = image_dir / "bbox_compare"
 
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(image_dir, exist_ok=True)
-    os.makedirs(gt_dir, exist_ok=True)
-    os.makedirs(pred_dir, exist_ok=True)
-    os.makedirs(compare_dir, exist_ok=True)
-    os.makedirs(bbox_compare_dir, exist_ok=True)
+    mask_dir = image_dir / "mask"
+    mask_gt_dir = mask_dir / "gt"
+    mask_pred_dir = mask_dir / "pred"
 
-    if args.save_masks:
-        os.makedirs(mask_dir, exist_ok=True)
-        os.makedirs(mask_gt_dir, exist_ok=True)
-        os.makedirs(mask_pred_dir, exist_ok=True)
+    compare_video_path = output_dir / "compare.mp4"
+    bbox_compare_video_path = output_dir / "bbox_compare.mp4"
 
-    compare_video_file = os.path.join(output_dir, "compare.mp4")
-    bbox_compare_video_file = os.path.join(output_dir, "bbox_compare.mp4")
+    metrics_path = output_dir / "metrics.csv"
+    summary_path = output_dir / "summary.json"
+    summary_csv_path = output_dir / "metrics_summary.csv"
 
-    metrics_csv_path = os.path.join(output_dir, "metrics.csv")
-    summary_csv_path = os.path.join(output_dir, "metrics_summary.csv")
-
-    print("device:", device)
-    print("accelerator:", accelerator)
-    print("project_root:", project_root)
-    print("test_dir:", test_dir)
-    print("output_dir:", output_dir)
-    print("checkpoint_path:", checkpoint_path)
-    print("test_dir exists:", os.path.exists(test_dir))
-    print("output_dir exists:", os.path.exists(output_dir))
-    print("checkpoint exists:", os.path.exists(checkpoint_path))
-    print("save_images:", args.save_images)
-    print("save_video:", args.save_video)
-    print("save_bbox_images:", args.save_bbox_images)
-    print("save_bbox_video:", args.save_bbox_video)
-    print("save_masks:", args.save_masks)
-    print("compute_fid:", args.fid)
-    print("mask_threshold:", args.mask_threshold)
-    print("use_morphology:", args.use_morphology)
-    print("keep_largest_gt:", args.keep_largest_gt)
-    print("keep_largest_pred:", args.keep_largest_pred)
-
-    dataset_test = WificamDataset(test_dir, args.window_size)
-
-    dataloader_test = DataLoader(
-        dataset_test,
-        batch_size=args.batch_size * 2,
-        shuffle=False,
-        drop_last=False,
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False,
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    model = VAE.load_from_checkpoint(
-        checkpoint_path,
+    if args.save_images:
+        gt_dir.mkdir(parents=True, exist_ok=True)
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        compare_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.save_bbox_images:
+        bbox_compare_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    if args.save_masks:
+        mask_gt_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        mask_pred_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    # --------------------------------------------------------
+    # 장치 설정
+    # --------------------------------------------------------
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print("device:", device)
+    print("data_dir:", args.data_dir)
+    print("checkpoint:", args.checkpoint)
+    print("normalization_path:", args.normalization_path)
+    print("output_dir:", output_dir)
+    print("mask_threshold:", args.mask_threshold)
+    print("save_images:", args.save_images)
+    print("save_bbox_images:", args.save_bbox_images)
+    print("save_masks:", args.save_masks)
+    print("save_video:", args.save_video)
+    print("save_bbox_video:", args.save_bbox_video)
+
+    # --------------------------------------------------------
+    # 데이터셋
+    # --------------------------------------------------------
+    stats = NormalizationStats.load(
+        args.normalization_path
+    )
+
+    csv_paths = discover_csi_csvs(
+        args.data_dir
+    )
+
+    if not csv_paths:
+        raise RuntimeError(
+            f"CSI CSV를 찾지 못했습니다: {args.data_dir}"
+        )
+
+    dataset = WificamDataset(
+        csv_paths=csv_paths,
         window_size=args.window_size,
-        num_subcarriers=NUM_SUBCARRIERS,
+        normalization_stats=stats,
+        is_train=False,
+        noise_std=0.0,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        persistent_workers=args.num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    print("평가 데이터 개수:", len(dataset))
+
+    # --------------------------------------------------------
+    # 모델
+    # --------------------------------------------------------
+    model = VAE.load_from_checkpoint(
+        args.checkpoint,
+        map_location=device,
     )
 
     model.to(device)
     model.eval()
 
-    # =========================
-    # FID 준비
-    # =========================
-    fid_metric = None
+    # --------------------------------------------------------
+    # 평가용 변수
+    # --------------------------------------------------------
+    rows: list[dict[str, object]] = []
 
-    if args.fid:
-        try:
-            from torchmetrics.image.fid import FrechetInceptionDistance
+    sample_index = 0
+    saved_image_count = 0
+    saved_bbox_count = 0
+    saved_mask_count = 0
 
-            fid_metric = FrechetInceptionDistance(feature=2048, normalize=False)
-            fid_metric = fid_metric.to(device)
-            print("FID metric loaded.")
-        except Exception as e:
-            print("FID metric load 실패. FID는 계산하지 않습니다.")
-            print("에러:", e)
-            fid_metric = None
-
-    rows = []
-
-    psnr_values = []
-    ssim_values = []
-    iou_values = []
-    dice_values = []
-    bbox_iou_values = []
-
-    saved_count = 0
-
-    # =========================
-    # Inference Loop
-    # =========================
-    for batch in tqdm(dataloader_test, desc="추론 및 이미지 저장 중"):
-        spectrogram, image, image_path = batch
-
-        spectrogram = spectrogram.to(device)
-        image = image.to(device)
-
-        with torch.no_grad():
-            qz_x, skip = model.encode(spectrogram)
-            reconstruction = model.decode(qz_x, skip)
-
-        image = image.permute(0, 2, 3, 1).cpu().numpy()
-        reconstruction = reconstruction.permute(0, 2, 3, 1).cpu().numpy()
-
-        for i in range(len(reconstruction)):
-            # GT / Pred 자체만 사용
-            # 배경 합성 안 함
-            data_content = (np.clip(image[i][..., ::-1], 0, 1) * 255).astype(np.uint8)
-            pred_content = (np.clip(reconstruction[i][..., ::-1], 0, 1) * 255).astype(np.uint8)
-
-            filename = os.path.basename(image_path[i])
-            name = os.path.splitext(filename)[0]
-
-            h, w = data_content.shape[:2]
-            if pred_content.shape[:2] != (h, w):
-                pred_content = cv2.resize(pred_content, (w, h))
-
-            # =========================
-            # Mask 생성
-            # =========================
-            mask_gt = make_binary_mask(
-                data_content,
-                threshold=args.mask_threshold,
-                use_morphology=args.use_morphology,
-                keep_largest=args.keep_largest_gt,
+    # --------------------------------------------------------
+    # 추론
+    # --------------------------------------------------------
+    with torch.inference_mode():
+        for batch in tqdm(
+            loader,
+            desc="추론 및 이미지 저장",
+        ):
+            csi = batch["csi"].to(
+                device,
+                non_blocking=True,
             )
 
-            mask_pred = make_binary_mask(
-                pred_content,
-                threshold=args.mask_threshold,
-                use_morphology=args.use_morphology,
-                keep_largest=args.keep_largest_pred,
+            window_mean = batch["window_mean"].to(
+                device,
+                non_blocking=True,
             )
 
-            # =========================
-            # bbox 생성
-            # =========================
-            gt_bbox = get_bbox_from_mask(mask_gt)
-            pred_bbox = get_bbox_from_mask(mask_pred)
-
-            # =========================
-            # Compare
-            # 왼쪽: GT 원본 / 오른쪽: Pred 원본
-            # 배경 합성 없음
-            # =========================
-            compare = np.concatenate([data_content, pred_content], axis=1)
-
-            # =========================
-            # bbox Compare
-            # 왼쪽: GT + bbox / 오른쪽: Pred + bbox
-            # =========================
-            bbox_compare, gt_bbox_vis, pred_bbox_vis = make_bbox_visualization(
-                data_content,
-                pred_content,
-                mask_gt,
-                mask_pred,
+            target = batch["image"].to(
+                device,
+                non_blocking=True,
             )
 
-            # =========================
-            # Metrics 계산
-            # =========================
-            psnr = compute_psnr(data_content, pred_content)
-            ssim_score = compute_ssim(data_content, pred_content)
-            iou = compute_iou(mask_gt, mask_pred)
-            dice = compute_dice(mask_gt, mask_pred)
-            bbox_iou = compute_bbox_iou_from_bboxes(gt_bbox, pred_bbox)
+            image_paths = batch["image_path"]
 
-            psnr_values.append(psnr if np.isfinite(psnr) else np.nan)
-            ssim_values.append(ssim_score)
-            iou_values.append(iou)
-            dice_values.append(dice)
-            bbox_iou_values.append(bbox_iou)
-
-            rows.append(
-                {
-                    "filename": filename,
-                    "psnr": psnr,
-                    "ssim": ssim_score,
-                    "iou": iou,
-                    "dice": dice,
-                    "bbox_iou": bbox_iou,
-                    "gt_bbox": gt_bbox,
-                    "pred_bbox": pred_bbox,
-                }
+            autocast_context = (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                )
+                if device.type == "cuda"
+                else nullcontext()
             )
 
-            # =========================
-            # FID 업데이트
-            # =========================
-            if fid_metric is not None:
-                with torch.no_grad():
-                    real_tensor = to_fid_tensor(data_content).to(device)
-                    fake_tensor = to_fid_tensor(pred_content).to(device)
-
-                    fid_metric.update(real_tensor, real=True)
-                    fid_metric.update(fake_tensor, real=False)
-
-            # =========================
-            # 이미지 저장
-            # =========================
-            if args.save_images:
-                cv2.imwrite(os.path.join(gt_dir, f"{name}.png"), data_content)
-                cv2.imwrite(os.path.join(pred_dir, f"{name}.png"), pred_content)
-                cv2.imwrite(os.path.join(compare_dir, f"{name}.png"), compare)
-
-            # =========================
-            # mask 저장
-            # =========================
-            if args.save_masks:
-                cv2.imwrite(
-                    os.path.join(mask_gt_dir, f"{name}.png"),
-                    (mask_gt.astype(np.uint8) * 255),
+            with autocast_context:
+                _, prediction = model(
+                    csi,
+                    window_mean,
                 )
 
-                cv2.imwrite(
-                    os.path.join(mask_pred_dir, f"{name}.png"),
-                    (mask_pred.astype(np.uint8) * 255),
+            prediction = prediction.float()
+            target = target.float()
+
+            # ------------------------------------------------
+            # Metric 계산
+            # ------------------------------------------------
+            psnr_values = batch_psnr(
+                prediction,
+                target,
+            )
+
+            ssim_values = batch_ssim(
+                prediction,
+                target,
+            )
+
+            prediction_mask = masks_from_images(
+                prediction,
+                args.mask_threshold,
+            )
+
+            target_mask = masks_from_images(
+                target,
+                args.mask_threshold,
+            )
+
+            iou_values, dice_values = batch_iou_dice(
+                prediction_mask,
+                target_mask,
+            )
+
+            prediction_mask_np = (
+                prediction_mask
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            target_mask_np = (
+                target_mask
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            # ------------------------------------------------
+            # 배치 내부 샘플별 저장
+            # ------------------------------------------------
+            for batch_index in range(prediction.shape[0]):
+                current_image_path = str(
+                    image_paths[batch_index]
                 )
 
-            # =========================
-            # bbox 이미지 저장
-            # =========================
-            if args.save_bbox_images:
-                cv2.imwrite(
-                    os.path.join(bbox_compare_dir, f"{name}_bbox.png"),
-                    bbox_compare,
+                original_name = Path(
+                    current_image_path
+                ).stem
+
+                # 같은 파일 이름이 여러 폴더에 존재하더라도
+                # 덮어쓰지 않도록 sample_index 추가
+                save_name = (
+                    f"{sample_index:06d}_"
+                    f"{original_name}.png"
                 )
 
-            saved_count += 1
+                target_bgr = tensor_to_bgr(
+                    target[batch_index]
+                )
 
-    # =========================
-    # compare 폴더 이미지들로 영상 생성
-    # =========================
-    if args.save_video:
-        make_video_from_image_folder(
-            image_folder=compare_dir,
-            output_video_path=compare_video_file,
-            fps=args.fps,
+                prediction_bgr = tensor_to_bgr(
+                    prediction[batch_index]
+                )
+
+                # 출력 크기가 다른 경우 GT 크기에 맞춤
+                target_height, target_width = (
+                    target_bgr.shape[:2]
+                )
+
+                if prediction_bgr.shape[:2] != (
+                    target_height,
+                    target_width,
+                ):
+                    prediction_bgr = cv2.resize(
+                        prediction_bgr,
+                        (target_width, target_height),
+                    )
+
+                current_target_mask = (
+                    target_mask_np[batch_index]
+                )
+
+                current_prediction_mask = (
+                    prediction_mask_np[batch_index]
+                )
+
+                target_bbox = bbox_from_mask(
+                    current_target_mask
+                )
+
+                prediction_bbox = bbox_from_mask(
+                    current_prediction_mask
+                )
+
+                current_bbox_iou = bbox_iou(
+                    prediction_bbox,
+                    target_bbox,
+                )
+
+                window_mean_value = float(
+                    window_mean[batch_index]
+                    .reshape(-1)[0]
+                    .item()
+                )
+
+                rows.append(
+                    {
+                        "sample_index": sample_index,
+                        "image_path": current_image_path,
+                        "window_mean": window_mean_value,
+                        "psnr": float(
+                            psnr_values[batch_index].item()
+                        ),
+                        "ssim": float(
+                            ssim_values[batch_index].item()
+                        ),
+                        "iou": float(
+                            iou_values[batch_index].item()
+                        ),
+                        "dice": float(
+                            dice_values[batch_index].item()
+                        ),
+                        "bbox_iou": current_bbox_iou,
+                        "gt_bbox": target_bbox,
+                        "pred_bbox": prediction_bbox,
+                    }
+                )
+
+                # --------------------------------------------
+                # GT / Pred / Compare 이미지 저장
+                # --------------------------------------------
+                if args.save_images:
+                    compare_image = np.concatenate(
+                        [
+                            target_bgr,
+                            prediction_bgr,
+                        ],
+                        axis=1,
+                    )
+
+                    save_image(
+                        gt_dir / save_name,
+                        target_bgr,
+                    )
+
+                    save_image(
+                        pred_dir / save_name,
+                        prediction_bgr,
+                    )
+
+                    save_image(
+                        compare_dir / save_name,
+                        compare_image,
+                    )
+
+                    saved_image_count += 1
+
+                # --------------------------------------------
+                # bbox 비교 이미지 저장
+                # --------------------------------------------
+                if args.save_bbox_images:
+                    bbox_compare_image = (
+                        make_bbox_visualization(
+                            target_bgr=target_bgr,
+                            prediction_bgr=prediction_bgr,
+                            target_bbox=target_bbox,
+                            prediction_bbox=prediction_bbox,
+                        )
+                    )
+
+                    bbox_save_name = (
+                        f"{sample_index:06d}_"
+                        f"{original_name}_bbox.png"
+                    )
+
+                    save_image(
+                        bbox_compare_dir / bbox_save_name,
+                        bbox_compare_image,
+                    )
+
+                    saved_bbox_count += 1
+
+                # --------------------------------------------
+                # GT / Pred 마스크 저장
+                # --------------------------------------------
+                if args.save_masks:
+                    target_mask_image = (
+                        current_target_mask.astype(
+                            np.uint8
+                        )
+                        * 255
+                    )
+
+                    prediction_mask_image = (
+                        current_prediction_mask.astype(
+                            np.uint8
+                        )
+                        * 255
+                    )
+
+                    save_image(
+                        mask_gt_dir / save_name,
+                        target_mask_image,
+                    )
+
+                    save_image(
+                        mask_pred_dir / save_name,
+                        prediction_mask_image,
+                    )
+
+                    saved_mask_count += 1
+
+                sample_index += 1
+
+    if not rows:
+        raise RuntimeError(
+            "평가 샘플이 없습니다."
         )
 
-    # =========================
-    # bbox compare 폴더 이미지들로 영상 생성
-    # =========================
-    if args.save_bbox_video:
-        make_video_from_image_folder(
-            image_folder=bbox_compare_dir,
-            output_video_path=bbox_compare_video_file,
-            fps=args.fps,
+    # --------------------------------------------------------
+    # 샘플별 metrics.csv 저장
+    # --------------------------------------------------------
+    with metrics_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(rows[0].keys()),
         )
 
-    # =========================
-    # FID 최종 계산
-    # =========================
-    fid_score = None
-
-    if fid_metric is not None:
-        try:
-            fid_score = float(fid_metric.compute().item())
-        except Exception as e:
-            print("FID 계산 실패:", e)
-            fid_score = None
-
-    # =========================
-    # metrics.csv 저장
-    # =========================
-    with open(metrics_csv_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "filename",
-            "psnr",
-            "ssim",
-            "iou",
-            "dice",
-            "bbox_iou",
-            "gt_bbox",
-            "pred_bbox",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+        writer.writerows(rows)
 
-        for row in rows:
-            writer.writerow(row)
-
-    # =========================
-    # metrics_summary.csv 저장
-    # =========================
-    summary_rows = [
-        {
-            "metric": "PSNR",
-            "mean": safe_mean(psnr_values),
-            "std": safe_std(psnr_values),
-        },
-        {
-            "metric": "SSIM",
-            "mean": safe_mean(ssim_values),
-            "std": safe_std(ssim_values),
-        },
-        {
-            "metric": "IoU",
-            "mean": safe_mean(iou_values),
-            "std": safe_std(iou_values),
-        },
-        {
-            "metric": "Dice",
-            "mean": safe_mean(dice_values),
-            "std": safe_std(dice_values),
-        },
-        {
-            "metric": "bbox_IoU",
-            "mean": safe_mean(bbox_iou_values),
-            "std": safe_std(bbox_iou_values),
-        },
+    # --------------------------------------------------------
+    # 평균 및 표준편차 계산
+    # --------------------------------------------------------
+    metric_names = [
+        "psnr",
+        "ssim",
+        "iou",
+        "dice",
+        "bbox_iou",
     ]
 
-    if fid_score is not None:
-        summary_rows.append(
+    summary: dict[str, object] = {
+        "sample_count": len(rows),
+        "checkpoint": str(
+            Path(args.checkpoint).resolve()
+        ),
+        "normalization_path": str(
+            Path(args.normalization_path).resolve()
+        ),
+        "mask_threshold": args.mask_threshold,
+    }
+
+    summary_csv_rows: list[dict[str, object]] = []
+
+    for metric_name in metric_names:
+        values = np.asarray(
+            [
+                float(row[metric_name])
+                for row in rows
+            ],
+            dtype=np.float64,
+        )
+
+        metric_mean = float(
+            np.nanmean(values)
+        )
+
+        metric_std = float(
+            np.nanstd(values)
+        )
+
+        summary[metric_name] = {
+            "mean": metric_mean,
+            "std": metric_std,
+        }
+
+        summary_csv_rows.append(
             {
-                "metric": "FID",
-                "mean": fid_score,
-                "std": "",
+                "metric": metric_name,
+                "mean": metric_mean,
+                "std": metric_std,
             }
         )
 
-    with open(summary_csv_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["metric", "mean", "std"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    # --------------------------------------------------------
+    # summary.json 저장
+    # --------------------------------------------------------
+    summary_path.write_text(
+        json.dumps(
+            summary,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # --------------------------------------------------------
+    # metrics_summary.csv 저장
+    # --------------------------------------------------------
+    with summary_csv_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "metric",
+                "mean",
+                "std",
+            ],
+        )
+
         writer.writeheader()
+        writer.writerows(summary_csv_rows)
 
-        for row in summary_rows:
-            writer.writerow(row)
+    # --------------------------------------------------------
+    # Compare 영상 생성
+    # --------------------------------------------------------
+    if args.save_video:
+        make_video_from_image_folder(
+            image_folder=compare_dir,
+            output_video_path=compare_video_path,
+            fps=args.fps,
+        )
 
-    print("\n저장 완료!")
-    print("처리된 이미지 개수:", saved_count)
+    # --------------------------------------------------------
+    # bbox Compare 영상 생성
+    # --------------------------------------------------------
+    if args.save_bbox_video:
+        make_video_from_image_folder(
+            image_folder=bbox_compare_dir,
+            output_video_path=bbox_compare_video_path,
+            fps=args.fps,
+        )
+
+    # --------------------------------------------------------
+    # 결과 출력
+    # --------------------------------------------------------
+    print("\n평가 완료")
+    print("전체 평가 샘플:", len(rows))
+    print("저장된 GT/Pred/Compare 이미지:", saved_image_count)
+    print("저장된 bbox 이미지:", saved_bbox_count)
+    print("저장된 마스크 이미지:", saved_mask_count)
 
     print("\n[평균 지표]")
-    print("PSNR:", safe_mean(psnr_values))
-    print("SSIM:", safe_mean(ssim_values))
-    print("IoU:", safe_mean(iou_values))
-    print("Dice:", safe_mean(dice_values))
-    print("bbox IoU:", safe_mean(bbox_iou_values))
 
-    if fid_score is not None:
-        print("FID:", fid_score)
-    else:
-        print("FID: 계산 안 함")
+    for metric_name in metric_names:
+        metric_summary = summary[metric_name]
+
+        print(
+            f"{metric_name}: "
+            f"{metric_summary['mean']} "
+            f"(std: {metric_summary['std']})"
+        )
 
     print("\n[저장 경로]")
-    print("metrics.csv:", metrics_csv_path)
-    print("metrics_summary.csv:", summary_csv_path)
+    print("Metrics:", metrics_path)
+    print("Summary JSON:", summary_path)
+    print("Summary CSV:", summary_csv_path)
 
     if args.save_images:
-        print("GT 이미지 폴더:", gt_dir)
-        print("Pred 이미지 폴더:", pred_dir)
-        print("Compare 이미지 폴더:", compare_dir)
+        print("GT 이미지:", gt_dir)
+        print("Pred 이미지:", pred_dir)
+        print("Compare 이미지:", compare_dir)
 
     if args.save_bbox_images:
-        print("bbox Compare 이미지 폴더:", bbox_compare_dir)
+        print("bbox Compare 이미지:", bbox_compare_dir)
 
     if args.save_masks:
-        print("GT mask 폴더:", mask_gt_dir)
-        print("Pred mask 폴더:", mask_pred_dir)
+        print("GT Mask 이미지:", mask_gt_dir)
+        print("Pred Mask 이미지:", mask_pred_dir)
 
     if args.save_video:
-        print("Compare 영상:", compare_video_file)
+        print("Compare 영상:", compare_video_path)
 
     if args.save_bbox_video:
-        print("bbox Compare 영상:", bbox_compare_video_file)
+        print("bbox Compare 영상:", bbox_compare_video_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--test_dir",
-        type=str,
-        default=r"C:\Users\user\Desktop\3d\CSI-to-image-reconstruction\03_Model_Training\data\rx1_test",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=r"C:\Users\user\Desktop\3d\CSI-to-image-reconstruction\03_Model_Training\03_Mesh\outputs\0708_outputs_rx1_dice_iou_loss",
-    )
-    parser.add_argument(
-        "--checkpoint_path",
-        type=str,
-        default=r"C:\Users\user\Desktop\3d\CSI-to-image-reconstruction\03_Model_Training\03_Mesh\outputs\0708_outputs_rx1_dice_iou_loss\latest-epoch=199-val_loss=0.2015403.ckpt",
-    )
-
-    parser.add_argument("--window_size", type=int, default=151)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--fps", type=int, default=10)
-
-    # 저장 옵션
-    parser.add_argument("--save_images", action="store_true", default=True)
-    parser.add_argument("--no_save_images", dest="save_images", action="store_false")
-
-    parser.add_argument("--save_video", action="store_true", default=True)
-    parser.add_argument("--no_save_video", dest="save_video", action="store_false")
-
-    parser.add_argument("--save_bbox_images", action="store_true", default=True)
-    parser.add_argument("--no_save_bbox_images", dest="save_bbox_images", action="store_false")
-
-    parser.add_argument("--save_bbox_video", action="store_true", default=True)
-    parser.add_argument("--no_save_bbox_video", dest="save_bbox_video", action="store_false")
-
-    parser.add_argument("--save_masks", action="store_true", default=False)
-
-    # metric / mask 옵션
-    parser.add_argument("--mask_threshold", type=int, default=10)
-    parser.add_argument("--use_morphology", action="store_true")
-
-    parser.add_argument("--keep_largest_gt", action="store_true", default=False)
-    parser.add_argument("--keep_largest_pred", action="store_true", default=False)
-
-    # FID 옵션
-    parser.add_argument("--fid", action="store_true")
-
-    args = parser.parse_args()
-
-    main(args)
+    main()
